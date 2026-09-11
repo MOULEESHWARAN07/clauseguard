@@ -105,11 +105,6 @@ clauseguard/
         └── services/api.js
 ```
 
----
-
-## 🧑‍💻 Resume Description
-
-> Built **ClauseGuard**, a full-stack AI document risk analyzer using RAG (FAISS + sentence-transformers) and local LLM (Ollama/LLaMA) to extract and score contract clauses. Features include PDF highlight overlay, streaming document Q&A, and version comparison with impact analysis. Stack: FastAPI · React · PyMuPDF · spaCy · LangChain.
 
 ---
 
