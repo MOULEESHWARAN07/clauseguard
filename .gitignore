@@ -1,0 +1,16 @@
+# Node modules (huge — never push this)
+node_modules/
+dist/
+.next/
+
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+*.log
