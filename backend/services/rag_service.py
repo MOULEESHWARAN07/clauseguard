@@ -1,25 +1,7 @@
-import os
-import pickle
-import numpy as np
-from typing import List, Dict, Tuple
-from pathlib import Path
+import re
+from typing import List, Tuple, Dict
 
-# Use sentence-transformers for local embeddings (no API key needed)
-try:
-    from sentence_transformers import SentenceTransformer
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-    USE_EMBEDDINGS = True
-except Exception as e:
-    print(f"Warning: sentence-transformers not available: {e}")
-    USE_EMBEDDINGS = False
-
-try:
-    import faiss
-    USE_FAISS = True
-except:
-    USE_FAISS = False
-
-# In-memory store: doc_id -> {chunks, embeddings, index}
+# In-memory store: doc_id -> {chunks}
 vector_stores: Dict[str, Dict] = {}
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
@@ -36,70 +18,40 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
     return chunks
 
 def build_vector_store(doc_id: str, full_text: str) -> int:
-    """Build FAISS index for a document. Returns number of chunks."""
+    """Build keyword index for a document."""
     chunks = chunk_text(full_text)
     if not chunks:
         return 0
-
-    if USE_EMBEDDINGS and USE_FAISS:
-        embeddings = embedding_model.encode(chunks, show_progress_bar=False)
-        embeddings = np.array(embeddings, dtype='float32')
-
-        dimension = embeddings.shape[1]
-        index = faiss.IndexFlatL2(dimension)
-        index.add(embeddings)
-
-        vector_stores[doc_id] = {
-            "chunks": chunks,
-            "index": index,
-            "embeddings": embeddings
-        }
-    else:
-        # Fallback: keyword-based search
-        vector_stores[doc_id] = {
-            "chunks": chunks,
-            "index": None,
-            "embeddings": None
-        }
-
+    vector_stores[doc_id] = {"chunks": chunks}
     return len(chunks)
 
-def search_similar(doc_id: str, query: str, top_k: int = 5) -> List[Tuple[str, float]]:
-    """Search for relevant chunks given a query."""
-    if doc_id not in vector_stores:
-        return []
-
-    store = vector_stores[doc_id]
-    chunks = store["chunks"]
-
-    if USE_EMBEDDINGS and USE_FAISS and store["index"] is not None:
-        query_embedding = embedding_model.encode([query])
-        query_embedding = np.array(query_embedding, dtype='float32')
-
-        distances, indices = store["index"].search(query_embedding, min(top_k, len(chunks)))
-
-        results = []
-        for dist, idx in zip(distances[0], indices[0]):
-            if idx < len(chunks):
-                results.append((chunks[idx], float(dist)))
-        return results
-    else:
-        # Fallback: simple keyword search
-        query_words = set(query.lower().split())
-        scored = []
-        for chunk in chunks:
-            chunk_words = set(chunk.lower().split())
-            score = len(query_words & chunk_words) / max(len(query_words), 1)
-            scored.append((chunk, score))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored[:top_k]
+def keyword_score(query: str, chunk: str) -> float:
+    """Score chunk relevance using keyword matching."""
+    query_words = set(re.findall(r'\w+', query.lower()))
+    chunk_words = set(re.findall(r'\w+', chunk.lower()))
+    # Remove common stop words
+    stop_words = {'the','a','an','is','are','was','were','be','been',
+                  'being','have','has','had','do','does','did','will',
+                  'would','could','should','may','might','shall','can',
+                  'to','of','in','for','on','with','at','by','from',
+                  'and','or','but','if','then','that','this','it','its'}
+    query_words -= stop_words
+    chunk_words -= stop_words
+    if not query_words:
+        return 0.0
+    overlap = len(query_words & chunk_words)
+    return overlap / len(query_words)
 
 def get_top_chunks(doc_id: str, query: str, top_k: int = 5) -> List[str]:
-    """Get top-k relevant chunks as strings."""
-    results = search_similar(doc_id, query, top_k)
-    return [chunk for chunk, _ in results]
+    """Get top-k relevant chunks using keyword search."""
+    if doc_id not in vector_stores:
+        return []
+    chunks = vector_stores[doc_id]["chunks"]
+    scored = [(chunk, keyword_score(query, chunk)) for chunk in chunks]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [chunk for chunk, score in scored[:top_k] if score >= 0]
 
 def delete_store(doc_id: str):
-    """Remove a document's vector store."""
+    """Remove a document's store."""
     if doc_id in vector_stores:
         del vector_stores[doc_id]
