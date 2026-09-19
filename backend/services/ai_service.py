@@ -1,154 +1,112 @@
-import httpx
+﻿import httpx
 import json
-import re
+import os
 from typing import Dict, Any, List, AsyncGenerator
+from dotenv import load_dotenv
 
-OLLAMA_BASE_URL = "http://localhost:11434"
-MODEL_NAME = "llama3.2"
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+MODEL_NAME = "llama-3.1-8b-instant"
+
 
 async def score_clause(clause_text: str) -> Dict[str, Any]:
-    """Score a single clause for risk using Ollama."""
-    prompt = f"""You are a legal contract risk analyzer. Analyze this contract clause and return ONLY valid JSON, nothing else.
-
-Clause: "{clause_text}"
-
-Return this exact JSON structure:
-{{
-  "risk_score": <integer 1-5>,
-  "category": "<one of: penalty, auto_renewal, liability_cap, indemnity, termination, ip_ownership, jurisdiction, confidentiality, payment, warranty, force_majeure, general>",
-  "explanation": "<one sentence explanation of the risk>",
-  "flagged": <true if risk_score >= 3, else false>
-}}
-
-Risk score guide: 1=no risk, 2=low, 3=moderate, 4=high, 5=critical"""
-
+    print(f"Scoring: {clause_text[:50]}")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
-                f"{OLLAMA_BASE_URL}/api/generate",
+                f"{GROQ_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
                 json={
                     "model": MODEL_NAME,
-                    "prompt": prompt,
-                    "stream": False,
-                    "format": "json"
+                    "messages": [
+                        {"role": "system", "content": "You are a legal risk analyzer. Return valid JSON only."},
+                        {"role": "user", "content": f"Analyze this clause: {clause_text}. Return JSON with risk_score 1-5, category, explanation, flagged true/false"}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 200,
+                    "response_format": {"type": "json_object"}
                 }
             )
             if response.status_code == 200:
-                data = response.json()
-                result_text = data.get("response", "{}")
-                try:
-                    result = json.loads(result_text)
-                    return {
-                        "risk_score": int(result.get("risk_score", 1)),
-                        "category": result.get("category", "general"),
-                        "explanation": result.get("explanation", "No significant risk detected."),
-                        "flagged": bool(result.get("flagged", False))
-                    }
-                except:
-                    return default_score()
+                result = json.loads(response.json()["choices"][0]["message"]["content"])
+                return {
+                    "risk_score": int(result.get("risk_score", 1)),
+                    "category": result.get("category", "general"),
+                    "explanation": result.get("explanation", "No risk detected."),
+                    "flagged": bool(result.get("flagged", False))
+                }
+            print(f"Groq error: {response.status_code}")
+            return default_score()
     except Exception as e:
-        print(f"Ollama error: {e}")
+        print(f"Exception: {e}")
         return default_score()
 
+
 def default_score() -> Dict[str, Any]:
-    return {
-        "risk_score": 1,
-        "category": "general",
-        "explanation": "Could not analyze clause automatically.",
-        "flagged": False
-    }
+    return {"risk_score": 1, "category": "general", "explanation": "Could not analyze.", "flagged": False}
+
 
 async def chat_with_document(question: str, context_chunks: List[str], history: List[Dict] = []) -> AsyncGenerator[str, None]:
-    """Stream chat response about a document using retrieved context."""
     context = "\n\n".join([f"[Clause {i+1}]: {chunk}" for i, chunk in enumerate(context_chunks)])
-
-    history_text = ""
-    for msg in history[-4:]:  # Last 4 messages for context
-        role = "User" if msg["role"] == "user" else "Assistant"
-        history_text += f"{role}: {msg['content']}\n"
-
-    prompt = f"""You are ClauseGuard, an expert contract analyst AI. Answer questions about the document based ONLY on the provided clauses.
-
-Document Clauses:
-{context}
-
-{f"Conversation history:{history_text}" if history_text else ""}
-
-User question: {question}
-
-Give a clear, helpful answer. If the answer is not in the document, say so. Be concise."""
-
+    messages = [{"role": "system", "content": f"You are ClauseGuard. Answer based ONLY on:\n{context}"}]
+    for msg in history[-4:]:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+    messages.append({"role": "user", "content": question})
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream(
-                "POST",
-                f"{OLLAMA_BASE_URL}/api/generate",
-                json={
-                    "model": MODEL_NAME,
-                    "prompt": prompt,
-                    "stream": True
-                }
+            async with client.stream("POST", f"{GROQ_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={"model": MODEL_NAME, "messages": messages, "temperature": 0.3, "max_tokens": 500, "stream": True}
             ) as response:
                 async for line in response.aiter_lines():
-                    if line:
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
                         try:
-                            data = json.loads(line)
-                            token = data.get("response", "")
+                            token = json.loads(data_str)["choices"][0]["delta"].get("content", "")
                             if token:
                                 yield token
-                            if data.get("done"):
-                                break
-                        except:
+                        except Exception:
                             continue
     except Exception as e:
-        yield f"Error connecting to Ollama: {str(e)}. Make sure Ollama is running with 'ollama serve'."
+        yield f"Error: {str(e)}"
+
 
 async def analyze_diff_impact(original: str, modified: str) -> str:
-    """Analyze business impact of a changed clause."""
-    prompt = f"""Compare these two contract clause versions and explain the business impact in 2 sentences.
-
-Original: "{original}"
-Modified: "{modified}"
-
-Return only the impact explanation, no preamble."""
-
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{OLLAMA_BASE_URL}/api/generate",
-                json={
-                    "model": MODEL_NAME,
-                    "prompt": prompt,
-                    "stream": False
-                }
+            response = await client.post(f"{GROQ_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={"model": MODEL_NAME, "messages": [
+                    {"role": "system", "content": "Legal analyst. Be concise."},
+                    {"role": "user", "content": f"Business impact in 2 sentences.\nOriginal: {original}\nModified: {modified}"}
+                ], "temperature": 0.1, "max_tokens": 150}
             )
             if response.status_code == 200:
-                return response.json().get("response", "Impact could not be determined.")
-    except:
-        pass
-    return "Impact analysis unavailable — ensure Ollama is running."
+                return response.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"Diff error: {e}")
+    return "Impact analysis unavailable."
+
 
 async def generate_summary(full_text: str) -> str:
-    """Generate a one-paragraph document summary."""
-    prompt = f"""Summarize this contract in 3 sentences. Focus on: parties involved, main purpose, key obligations.
-
-Contract (first 3000 chars):
-{full_text[:3000]}
-
-Return only the summary."""
-
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{OLLAMA_BASE_URL}/api/generate",
-                json={
-                    "model": MODEL_NAME,
-                    "prompt": prompt,
-                    "stream": False
-                }
+            response = await client.post(f"{GROQ_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                json={"model": MODEL_NAME, "messages": [
+                    {"role": "system", "content": "Legal document summarizer."},
+                    {"role": "user", "content": f"Summarize in 3 sentences:\n{full_text[:3000]}"}
+                ], "temperature": 0.1, "max_tokens": 200}
             )
             if response.status_code == 200:
-                return response.json().get("response", "")
-    except:
-        pass
+                return response.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"Summary error: {e}")
     return "Summary unavailable."
